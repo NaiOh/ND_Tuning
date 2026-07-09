@@ -1,7 +1,7 @@
 # ND Binary Tuning Assistant
 
 A Streamlit app that automates the model-review process used throughout this
-project: upload a ND xlsx export, get back a ranked, **Add: Yes/No** list
+project: upload an ND xlsx export, get back a ranked, **Add: Yes/No** list
 of binary-variable suggestions — which existing binaries look safe to drop,
 which missing calendar months are worth adding, which individual residuals
 look like data-quality issues rather than real seasonal effects, and any
