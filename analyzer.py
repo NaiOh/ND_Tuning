@@ -439,6 +439,153 @@ def find_outliers(err_df: pd.DataFrame, z_thresh: float = 2.5, top_n: int = 8) -
 
 
 # --------------------------------------------------------------------------
+# AR/MA diagnostics — residual ACF/PACF and an AIC/BIC-validated AR(1)
+# suggestion. Scope is intentionally AR(1)-only: MA(1) and higher-order AR
+# are flagged in the pattern read as a manual follow-up, not numerically
+# validated here.
+# --------------------------------------------------------------------------
+
+def _sample_acf(resid: np.ndarray, max_lag: int) -> np.ndarray:
+    """Sample autocorrelation function at lags 1..max_lag (mean-centered,
+    denominator = total sum of squares, i.e. the standard textbook estimator)."""
+    resid = resid - resid.mean()
+    n = len(resid)
+    denom = np.sum(resid ** 2)
+    if denom <= 0:
+        return np.zeros(max_lag)
+    acf = np.empty(max_lag)
+    for k in range(1, max_lag + 1):
+        if k >= n:
+            acf[k - 1] = 0.0
+            continue
+        num = np.sum(resid[k:] * resid[:-k])
+        acf[k - 1] = num / denom
+    return acf
+
+
+def _durbin_levinson_pacf(acf: np.ndarray, max_lag: int) -> np.ndarray:
+    """Partial autocorrelation function derived from the ACF via the
+    Durbin-Levinson recursion (pure numpy, no statsmodels dependency)."""
+    pacf = np.zeros(max_lag)
+    phi = np.zeros((max_lag + 1, max_lag + 1))
+    r = np.concatenate(([1.0], acf))  # r[0] = lag-0 autocorrelation = 1
+    if max_lag >= 1:
+        phi[1, 1] = r[1]
+        pacf[0] = phi[1, 1]
+    for k in range(2, max_lag + 1):
+        num = r[k] - sum(phi[k - 1, j] * r[k - j] for j in range(1, k))
+        den = 1 - sum(phi[k - 1, j] * r[j] for j in range(1, k))
+        phi[k, k] = num / den if den != 0 else 0.0
+        for j in range(1, k):
+            phi[k, j] = phi[k - 1, j] - phi[k, k] * phi[k - 1, k - j]
+        pacf[k - 1] = phi[k, k]
+    return pacf
+
+
+def ar_ma_diagnostics(err_df: pd.DataFrame, max_lag: int = 12) -> dict:
+    """Compute residual ACF/PACF from the Err sheet (sorted chronologically)
+    plus a lag-1-based AR(1) candidate and a plain-English Box-Jenkins-style
+    pattern read (AR-like / MA-like / mixed / white noise). Returns {} if
+    there isn't enough residual history to say anything useful."""
+    if err_df.empty or "Resid" not in err_df.columns:
+        return {}
+    sort_cols = [c for c in ["Year", "Month"] if c in err_df.columns]
+    ordered = err_df.sort_values(sort_cols) if sort_cols else err_df
+    resid = ordered["Resid"].dropna().to_numpy(dtype=float)
+    n = len(resid)
+    if n < 8:
+        return {}
+    max_lag = max(1, min(max_lag, n // 3))
+    acf = _sample_acf(resid, max_lag)
+    pacf = _durbin_levinson_pacf(acf, max_lag)
+    band = 1.96 / math.sqrt(n)  # ~95% white-noise significance band
+
+    acf_sig = np.abs(acf) > band
+    pacf_sig = np.abs(pacf) > band
+    tail = min(3, max_lag)
+
+    acf_cuts_off = bool(acf_sig[0] and not acf_sig[1:tail].any())
+    pacf_cuts_off = bool(pacf_sig[0] and not pacf_sig[1:tail].any())
+
+    if pacf_cuts_off and acf_sig[0] and not acf_cuts_off:
+        pattern = "AR(1)-like: PACF cuts off after lag 1, ACF decays gradually."
+    elif acf_cuts_off and pacf_sig[0] and not pacf_cuts_off:
+        pattern = "MA(1)-like: ACF cuts off after lag 1, PACF decays gradually. (Not numerically validated below — AR(1) is the only term this app tests.)"
+    elif acf_sig[0] and pacf_sig[0]:
+        pattern = "Mixed AR/MA-like: both ACF and PACF show structure beyond lag 1. Consider an ARMA(1,1) in ND rather than AR(1) alone."
+    elif not acf_sig.any() and not pacf_sig.any():
+        pattern = "No significant autocorrelation detected — residuals look like white noise."
+    else:
+        pattern = "Some autocorrelation at higher lags (possibly seasonal or higher-order) — inspect the chart before drawing conclusions."
+
+    return {
+        "acf": acf,
+        "pacf": pacf,
+        "band": band,
+        "n": n,
+        "max_lag": max_lag,
+        "lag1_acf": float(acf[0]),
+        "pattern": pattern,
+    }
+
+
+def suggest_ar1(pw: "ParsedWorkbook") -> Optional[dict]:
+    """Suggest an AR(1) coefficient from the lag-1 residual autocorrelation,
+    validated by comparing AIC/BIC of the structural OLS proxy (current
+    regressor spec) with vs. without that value applied as a Prais-Winsten
+    quasi-differencing correction. Returns None if there's not enough
+    residual history to compute this."""
+    diag = ar_ma_diagnostics(pw.err_df)
+    if not diag:
+        return None
+
+    candidate_rho = diag["lag1_acf"]
+    result = dict(diag)
+    result["candidate_rho"] = candidate_rho
+    result["already_has_ar1"] = pw.ar1 is not None
+
+    if abs(candidate_rho) < 0.05:
+        result["add_yes_no"] = "No"
+        result["delta_aic"] = None
+        result["delta_bic"] = None
+        result["rationale"] = (
+            f"Lag-1 residual autocorrelation is only {candidate_rho:+.3f} — too small for an "
+            "AR(1) term to meaningfully improve this fit."
+        )
+        return result
+
+    df = pw.data_df
+    target = pw.target_name
+    cols = list(pw.regressor_cols)
+    baseline = ols_fit(df, target, cols, rho=0.0)
+    candidate = ols_fit(df, target, cols, rho=candidate_rho)
+    delta_aic = candidate.aic - baseline.aic
+    delta_bic = candidate.bic - baseline.bic
+    is_yes = delta_bic < 0
+
+    result["delta_aic"] = delta_aic
+    result["delta_bic"] = delta_bic
+    result["add_yes_no"] = "Yes" if is_yes else "No"
+
+    if pw.ar1 is not None:
+        lead = f"ND already reports AR(1) = {pw.ar1:.3f}, but the exported residuals still show lag-1 autocorrelation ≈ {candidate_rho:+.3f}."
+    else:
+        lead = f"No AR(1) term is currently in the model; lag-1 residual autocorrelation ≈ {candidate_rho:+.3f}."
+
+    rationale = (
+        f"{lead} Quasi-differencing the current spec with ρ={candidate_rho:.3f} changes AIC by "
+        f"{delta_aic:+.2f} and BIC by {delta_bic:+.2f} versus the no-AR proxy fit. "
+    )
+    rationale += (
+        "BIC improves — worth trying this AR(1) value in ND and re-fitting."
+        if is_yes else
+        "BIC doesn't improve enough to justify it under the parsimony rule — likely not worth adding."
+    )
+    result["rationale"] = rationale
+    return result
+
+
+# --------------------------------------------------------------------------
 # Recommendation engine
 # --------------------------------------------------------------------------
 
