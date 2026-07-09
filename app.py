@@ -1,7 +1,7 @@
 """
-MetrixND Binary Tuning Assistant — Streamlit app.
+Just ND Binary Tuning Assistant — Streamlit app.
 
-Upload a MetrixND model export (.xlsx with Data/Coef/MStat/Err sheets) and get
+Upload a Just ND model export (.xlsx with Data/Coef/MStat/Err sheets) and get
 a ranked list of binary-variable recommendations: which existing binaries look
 safe to drop, which missing calendar months are worth adding, which individual
 data points look like data-quality issues, and any regressor whose sign looks
@@ -18,11 +18,11 @@ import streamlit as st
 
 import analyzer as az
 
-st.set_page_config(page_title="MetrixND Binary Tuning Assistant", layout="wide")
+st.set_page_config(page_title="Just ND Binary Tuning Assistant", layout="wide")
 
-st.title("MetrixND Binary Tuning Assistant")
+st.title("Just ND Binary Tuning Assistant")
 st.caption(
-    "Upload a MetrixND model export and get a ranked, Add: Yes/No list of "
+    "Upload a Just ND model export and get a ranked, Add: Yes/No list of "
     "binary-variable suggestions — same process used for manual model reviews, "
     "automated."
 )
@@ -32,7 +32,7 @@ with st.sidebar:
     p_thresh = st.slider(
         "Significance cutoff (p-value) for flagging existing binaries as removable",
         min_value=0.01, max_value=0.20, value=0.05, step=0.01,
-        help="Existing binaries in the real MetrixND fit with a reported p-value above this are flagged for removal.",
+        help="Existing binaries in the real Just ND fit with a reported p-value above this are flagged for removal.",
     )
     bic_pref = st.radio(
         "Selection rule for adding missing months",
@@ -44,7 +44,7 @@ with st.sidebar:
     st.divider()
     st.warning(az.AR_CAVEAT, icon="⚠️")
 
-uploaded = st.file_uploader("Upload MetrixND .xlsx export", type=["xlsx"])
+uploaded = st.file_uploader("Upload Just ND .xlsx export", type=["xlsx"])
 
 if uploaded is None:
     st.info(
@@ -62,7 +62,7 @@ except az.ParseError as e:
     st.error(str(e))
     st.stop()
 except Exception as e:
-    st.error(f"Couldn't read this file as a MetrixND export: {e}")
+    st.error(f"Couldn't read this file as a Just ND export: {e}")
     st.stop()
 
 st.success(f"Loaded **{pw.file_name}** — target variable **{pw.target_name}**, {len(pw.data_df)} observations.")
@@ -70,7 +70,7 @@ st.success(f"Loaded **{pw.file_name}** — target variable **{pw.target_name}**,
 # ---------------------------------------------------------------------------
 # Section 1: current model diagnostics
 # ---------------------------------------------------------------------------
-st.header("1. Current model diagnostics (as reported by MetrixND)")
+st.header("1. Current model diagnostics (as reported by Just ND)")
 
 m = pw.mstat
 
@@ -154,8 +154,8 @@ else:
 
 st.caption(
     "\"Add month\" rows come from a plain OLS proxy this app fits itself (candidates aren't in the "
-    "real MetrixND model yet, so there's no reported p-value to read). \"Remove existing\" and "
-    "\"Investigate\" rows are read directly from MetrixND's own Coef sheet. See the AR/MA caveat "
+    "real Just ND model yet, so there's no reported p-value to read). \"Remove existing\" and "
+    "\"Investigate\" rows are read directly from Just ND's own Coef sheet. See the AR/MA caveat "
     "in the sidebar before trusting the proxy numbers."
 )
 
@@ -208,7 +208,7 @@ with tab3:
 with tab4:
     st.write(
         "Continuous (non-binary) regressors — e.g. weather-driver variables — with a "
-        "significant negative coefficient in the real MetrixND fit. Not necessarily wrong, "
+        "significant negative coefficient in the real Just ND fit. Not necessarily wrong, "
         "but worth a sanity check against what the variable is supposed to represent."
     )
     if extras["sign_flags"]:
