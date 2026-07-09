@@ -1,7 +1,7 @@
 """
 Core analysis logic for the ND Binary Tuning app.
 
-Reads a ND xlsx export (sheets: Data, Coef, MStat, Err — DStat/Corr/Elas/BX/YHat
+Reads an ND xlsx export (sheets: Data, Coef, MStat, Err — DStat/Corr/Elas/BX/YHat
 are ignored) and produces a ranked list of binary-variable recommendations:
 which existing binaries look safe to drop, which missing calendar months look
 worth adding, and which individual data points look like data-quality issues
@@ -42,11 +42,75 @@ AR_CAVEAT = (
     "re-fit any accepted suggestion in ND itself before trusting it."
 )
 
+
+def build_ar_caveat(rho: Optional[float], ma1: Optional[float]) -> str:
+    """Caveat text shown in the app, adapted to whether an AR(1) correction
+    is actually being applied to the proxy fit this run."""
+    if rho:
+        msg = (
+            f"AR(1) correction is ACTIVE (ρ={rho:.3f}, applied via Prais-Winsten "
+            f"quasi-differencing before fitting) — this directly addresses the near-unit-root "
+            f"problem where a plain OLS proxy overstates a candidate binary's importance because "
+            f"the AR term already absorbs a persistent level shift. "
+        )
+    else:
+        msg = (
+            "No AR(1) correction is currently applied — these numbers come from a plain OLS "
+            "proxy. If ND's real model uses a meaningful AR(1) term, turn on the "
+            "correction in the sidebar (auto-detected from the Coef sheet, or entered manually) "
+            "for more reliable candidate comparisons. "
+        )
+    if ma1:
+        msg += (
+            f"Note: an MA(1) term (θ≈{ma1:.3f}) was also detected in the real model but is NOT "
+            f"corrected for here — MA errors don't reduce to as simple a linear transform as "
+            f"AR(1) does, so treat results with extra caution if |θ| is large."
+        )
+    else:
+        msg += "Always re-fit any accepted suggestion in ND itself before trusting it."
+    return msg
+
 REQUIRED_SHEETS = ["Data", "Coef", "MStat", "Err"]
 
 
 class ParseError(Exception):
     pass
+
+
+def detect_ar_ma(coef_df: pd.DataFrame) -> dict:
+    """Look for AR(1)/MA(1) rows ND reports directly in the Coef sheet
+    (e.g. Variable == "AR(1)") and pull out their fitted coefficients, if
+    present. Returns a dict with optional keys 'AR1' and 'MA1'."""
+    out: dict = {}
+    if coef_df.empty or "Variable" not in coef_df.columns:
+        return out
+    for _, row in coef_df.iterrows():
+        var = str(row["Variable"]).strip()
+        coefv = row.get("Coefficient")
+        if coefv is None or pd.isna(coefv):
+            continue
+        if re.search(r"AR\s*\(\s*1\s*\)", var, re.IGNORECASE):
+            out["AR1"] = float(coefv)
+        elif re.search(r"MA\s*\(\s*1\s*\)", var, re.IGNORECASE):
+            out["MA1"] = float(coefv)
+    return out
+
+
+def _prais_winsten_transform(y: np.ndarray, X: np.ndarray, rho: float):
+    """Quasi-difference y and X (which must already include an explicit
+    intercept column) so that an OLS fit on the transformed data approximates
+    GLS under AR(1) errors with autocorrelation coefficient `rho`. Assumes
+    rows are already in chronological order with no gaps — see the Year/Month
+    sort applied when the Data sheet is parsed."""
+    n = len(y)
+    factor = math.sqrt(max(1 - rho ** 2, 1e-12))
+    y_t = np.empty(n)
+    X_t = np.empty_like(X)
+    y_t[0] = y[0] * factor
+    X_t[0, :] = X[0, :] * factor
+    y_t[1:] = y[1:] - rho * y[:-1]
+    X_t[1:, :] = X[1:, :] - rho * X[:-1, :]
+    return y_t, X_t
 
 
 def _normal_sf_two_sided(z: np.ndarray) -> np.ndarray:
@@ -112,6 +176,8 @@ class ParsedWorkbook:
     coef_df: pd.DataFrame           # as reported by ND (Coef sheet)
     mstat: dict                     # as reported by ND (MStat sheet)
     err_df: pd.DataFrame            # residuals (Err sheet)
+    ar1: Optional[float] = None     # AR(1) coefficient, if ND reported one
+    ma1: Optional[float] = None     # MA(1) coefficient, if ND reported one
 
 
 def _sheet_rows(ws):
@@ -123,7 +189,7 @@ def load_workbook(file) -> ParsedWorkbook:
     missing = [s for s in REQUIRED_SHEETS if s not in wb.sheetnames]
     if missing:
         raise ParseError(
-            f"This doesn't look like a ND export — missing sheet(s): {', '.join(missing)}. "
+            f"This doesn't look like an ND export — missing sheet(s): {', '.join(missing)}. "
             f"Sheets found: {', '.join(wb.sheetnames)}"
         )
 
@@ -133,6 +199,7 @@ def load_workbook(file) -> ParsedWorkbook:
     coef_df = _parse_coef_sheet(wb["Coef"])
     mstat = _parse_mstat_sheet(wb["MStat"])
     err_df = _parse_err_sheet(wb["Err"])
+    ar_ma = detect_ar_ma(coef_df)
 
     return ParsedWorkbook(
         file_name=getattr(file, "name", "uploaded_file.xlsx"),
@@ -144,6 +211,8 @@ def load_workbook(file) -> ParsedWorkbook:
         coef_df=coef_df,
         mstat=mstat,
         err_df=err_df,
+        ar1=ar_ma.get("AR1"),
+        ma1=ar_ma.get("MA1"),
     )
 
 
@@ -179,6 +248,8 @@ def _parse_data_sheet(ws):
     for c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=[target_name])
+    # AR(1) quasi-differencing assumes strict chronological order with no gaps
+    df = df.sort_values(["Year", "Month"]).reset_index(drop=True)
 
     month_dummy_cols = {}
     for h in regressor_cols:
@@ -288,28 +359,43 @@ class FitResult:
     pvalue: np.ndarray = field(repr=False)
 
 
-def ols_fit(df: pd.DataFrame, target: str, cols: list) -> FitResult:
+def ols_fit(df: pd.DataFrame, target: str, cols: list, rho: float = 0.0) -> FitResult:
+    """Fit y on cols (plus intercept). If `rho` is non-zero, first
+    quasi-differences the data (Prais-Winsten) to approximate GLS under
+    AR(1) errors with that autocorrelation coefficient — this is what lets
+    the proxy account for ND's real AR(1) term instead of ignoring it.
+    AIC/BIC/R²/significance are computed in the (possibly transformed) space
+    used for fitting; MAPE is always reported back on the original scale for
+    interpretability."""
     cols = [c for c in cols if c in df.columns]
     y = df[target].to_numpy(dtype=float)
     Xraw = df[cols].to_numpy(dtype=float) if cols else np.zeros((len(df), 0))
     X = np.column_stack([np.ones(len(df)), Xraw])
-    beta, _, rank, _ = np.linalg.lstsq(X, y, rcond=None)
-    resid = y - X @ beta
-    n, k = X.shape
+
+    if rho:
+        y_fit, X_fit = _prais_winsten_transform(y, X, rho)
+    else:
+        y_fit, X_fit = y, X
+
+    beta, _, rank, _ = np.linalg.lstsq(X_fit, y_fit, rcond=None)
+    resid_fit = y_fit - X_fit @ beta
+    resid_orig = y - X @ beta
+
+    n, k = X_fit.shape
     dof = max(n - k, 1)
-    sse = float(np.sum(resid ** 2))
-    sst = float(np.sum((y - y.mean()) ** 2)) or 1e-9
+    sse = float(np.sum(resid_fit ** 2))
+    sst = float(np.sum((y_fit - y_fit.mean()) ** 2)) or 1e-9
     r2 = 1 - sse / sst
     adj_r2 = 1 - (1 - r2) * (n - 1) / dof
     safe_sse_n = max(sse / n, 1e-12)
     aic = n * np.log(safe_sse_n) + 2 * k
     bic = n * np.log(safe_sse_n) + k * np.log(n)
     nonzero_y = np.where(y != 0, y, np.nan)
-    mape = float(np.nanmean(np.abs(resid / nonzero_y))) * 100
+    mape = float(np.nanmean(np.abs(resid_orig / nonzero_y))) * 100
 
     sigma2 = sse / dof
     try:
-        xtx_inv = np.linalg.pinv(X.T @ X)
+        xtx_inv = np.linalg.pinv(X_fit.T @ X_fit)
         se = np.sqrt(np.clip(np.diag(xtx_inv) * sigma2, 0, None))
         tstat = np.divide(beta, se, out=np.zeros_like(beta), where=se > 0)
         pvalue = _normal_sf_two_sided(tstat)
@@ -423,13 +509,16 @@ def forward_select_months(
     base_cols: list,
     missing_months: list,
     bic_pref: bool = True,
+    rho: float = 0.0,
 ):
     """Greedy forward selection over missing calendar months. At each step,
     try adding every remaining candidate month dummy to the current column
     set; accept the one that most improves the chosen criterion (BIC by
     default, matching the parsimony rule used throughout manual analysis this
     session); stop when no remaining candidate improves it further. Returns
-    the list of accepted month numbers, plus a step-by-step trace table."""
+    the list of accepted month numbers, plus a step-by-step trace table.
+    `rho`, if non-zero, applies an AR(1) quasi-differencing correction to
+    every fit (see `ols_fit`)."""
     trace_cols = ["Step", "Candidate", "AIC", "BIC", "MAPE", "Improves"]
     if not missing_months:
         return [], pd.DataFrame(columns=trace_cols)
@@ -440,7 +529,7 @@ def forward_select_months(
         work_df[col] = (work_df["Month"] == mm).astype(float)
 
     current_cols = list(base_cols)
-    baseline = ols_fit(work_df, target, current_cols)
+    baseline = ols_fit(work_df, target, current_cols, rho=rho)
     accepted = []
     trace_rows = []
     remaining = list(missing_months)
@@ -453,7 +542,7 @@ def forward_select_months(
         for mm in remaining:
             col = f"_cand_{MONTH_ABBR[mm - 1]}"
             trial_cols = current_cols + [col]
-            fit = ols_fit(work_df, target, trial_cols)
+            fit = ols_fit(work_df, target, trial_cols, rho=rho)
             metric = fit.bic if bic_pref else fit.aic
             trace_rows.append({
                 "Step": len(accepted) + 1,
@@ -480,18 +569,18 @@ def forward_select_months(
 SOLO_DELTA_COLUMNS = ["Month", "MonthNum", "AIC", "BIC", "MAPE", "dAIC", "dBIC", "dMAPE", "PValue_new_var"]
 
 
-def individual_month_deltas(df, target, base_cols, missing_months) -> pd.DataFrame:
+def individual_month_deltas(df, target, base_cols, missing_months, rho: float = 0.0) -> pd.DataFrame:
     """AIC/BIC/MAPE for adding each missing month ALONE, for the 'ranked by
     impact' display (independent of whether it made the greedy cut)."""
     if not missing_months:
         return pd.DataFrame(columns=SOLO_DELTA_COLUMNS)
     work_df = df.copy()
-    baseline = ols_fit(work_df, target, base_cols)
+    baseline = ols_fit(work_df, target, base_cols, rho=rho)
     rows = []
     for mm in missing_months:
         col = f"_solo_{MONTH_ABBR[mm - 1]}"
         work_df[col] = (work_df["Month"] == mm).astype(float)
-        fit = ols_fit(work_df, target, base_cols + [col])
+        fit = ols_fit(work_df, target, base_cols + [col], rho=rho)
         rows.append({
             "Month": MONTH_ABBR[mm - 1],
             "MonthNum": mm,
@@ -506,12 +595,22 @@ def individual_month_deltas(df, target, base_cols, missing_months) -> pd.DataFra
     return pd.DataFrame(rows, columns=SOLO_DELTA_COLUMNS).sort_values("dAIC")
 
 
-def build_recommendations(pw: ParsedWorkbook, p_thresh: float = 0.05, bic_pref: bool = True):
+def build_recommendations(
+    pw: ParsedWorkbook,
+    p_thresh: float = 0.05,
+    bic_pref: bool = True,
+    rho: Optional[float] = None,
+):
     """Top-level entry point: returns (recommendations: list[Recommendation],
-    extras: dict of supporting tables for the UI)."""
+    extras: dict of supporting tables for the UI). `rho` is the AR(1)
+    coefficient to apply via quasi-differencing to every proxy fit; pass 0 (or
+    leave as None with no `pw.ar1` detected) to disable the correction. If
+    `rho` is None and ND reported an AR(1) term, that value is used
+    automatically."""
     df = pw.data_df
     target = pw.target_name
     base_cols = list(pw.regressor_cols)
+    effective_rho = rho if rho is not None else (pw.ar1 or 0.0)
 
     removal_df = existing_binary_removal_candidates(pw.coef_df, p_thresh)
     trimmed_cols = list(base_cols)
@@ -523,9 +622,9 @@ def build_recommendations(pw: ParsedWorkbook, p_thresh: float = 0.05, bic_pref: 
                 trimmed_cols.remove(mvar)
 
     accepted_months, trace_df = forward_select_months(
-        df, target, trimmed_cols, pw.missing_months, bic_pref=bic_pref
+        df, target, trimmed_cols, pw.missing_months, bic_pref=bic_pref, rho=effective_rho
     )
-    solo_deltas = individual_month_deltas(df, target, trimmed_cols, pw.missing_months)
+    solo_deltas = individual_month_deltas(df, target, trimmed_cols, pw.missing_months, rho=effective_rho)
 
     continuous_cols = continuous_regressors(df, base_cols)
     sign_flags = sign_check(pw.coef_df, continuous_cols, p_thresh)
@@ -596,5 +695,6 @@ def build_recommendations(pw: ParsedWorkbook, p_thresh: float = 0.05, bic_pref: 
         "sign_flags": sign_flags,
         "trimmed_cols": trimmed_cols,
         "accepted_months": [MONTH_ABBR[mm - 1] for mm in accepted_months],
+        "effective_rho": effective_rho,
     }
     return recs, extras
