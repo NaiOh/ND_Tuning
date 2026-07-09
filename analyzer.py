@@ -1,20 +1,20 @@
 """
-Core analysis logic for the MetrixND Binary Tuning app.
+Core analysis logic for the Just ND Binary Tuning app.
 
-Reads a MetrixND xlsx export (sheets: Data, Coef, MStat, Err — DStat/Corr/Elas/BX/YHat
+Reads a Just ND xlsx export (sheets: Data, Coef, MStat, Err — DStat/Corr/Elas/BX/YHat
 are ignored) and produces a ranked list of binary-variable recommendations:
 which existing binaries look safe to drop, which missing calendar months look
 worth adding, and which individual data points look like data-quality issues
 rather than real seasonal effects.
 
-IMPORTANT CAVEAT: MetrixND's real fit can include AR(1)/MA(1) autocorrelation
+IMPORTANT CAVEAT: Just ND's real fit can include AR(1)/MA(1) autocorrelation
 correction. This module has no access to that — it fits a plain OLS proxy on
 whatever columns are present in the Data sheet. For models with a
 near-unit-root AR(1) term (AR(1) close to 1), the proxy can badly overstate
 the importance of a candidate binary, because the AR term already absorbs a
 persistent level shift that a static OLS model has no way to explain except
 through a dummy variable. Always treat proxy significance as a lead to verify
-in MetrixND, not a final answer. See `AR_CAVEAT` for the exact wording shown
+in Just ND, not a final answer. See `AR_CAVEAT` for the exact wording shown
 in the app.
 """
 
@@ -35,11 +35,11 @@ MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
 
 AR_CAVEAT = (
     "These AIC/BIC/p-values come from a plain OLS proxy fit in this app, "
-    "not from MetrixND itself. MetrixND's real model may include AR(1)/MA(1) "
+    "not from Just ND itself. Just ND's real model may include AR(1)/MA(1) "
     "autocorrelation terms this proxy cannot replicate. When AR(1) is close "
     "to 1 (near unit-root), the real model can already absorb a persistent "
     "shift that this proxy will misattribute to a candidate binary — always "
-    "re-fit any accepted suggestion in MetrixND itself before trusting it."
+    "re-fit any accepted suggestion in Just ND itself before trusting it."
 )
 
 REQUIRED_SHEETS = ["Data", "Coef", "MStat", "Err"]
@@ -66,7 +66,7 @@ def _normal_sf_two_sided(z: np.ndarray) -> np.ndarray:
 # --------------------------------------------------------------------------
 
 def normalize_header(value) -> str:
-    """MetrixND/Excel often stores one-off event dummy headers (e.g. "Jan-18"
+    """Just ND/Excel often stores one-off event dummy headers (e.g. "Jan-18"
     meaning January 2018) as datetime cells once opened in Excel, with the
     real month in `.month` and the 2-digit year tucked into `.day`
     (e.g. datetime(2026, 1, 18) -> "Jan-18" -> label "Jan18"). Reconstruct a
@@ -109,8 +109,8 @@ class ParsedWorkbook:
     regressor_cols: list            # all regressor column names (order preserved)
     month_dummy_cols: dict          # month number -> column name, for bare seasonal dummies
     missing_months: list             # month numbers with no bare seasonal dummy
-    coef_df: pd.DataFrame           # as reported by MetrixND (Coef sheet)
-    mstat: dict                     # as reported by MetrixND (MStat sheet)
+    coef_df: pd.DataFrame           # as reported by Just ND (Coef sheet)
+    mstat: dict                     # as reported by Just ND (MStat sheet)
     err_df: pd.DataFrame            # residuals (Err sheet)
 
 
@@ -123,7 +123,7 @@ def load_workbook(file) -> ParsedWorkbook:
     missing = [s for s in REQUIRED_SHEETS if s not in wb.sheetnames]
     if missing:
         raise ParseError(
-            f"This doesn't look like a MetrixND export — missing sheet(s): {', '.join(missing)}. "
+            f"This doesn't look like a Just ND export — missing sheet(s): {', '.join(missing)}. "
             f"Sheets found: {', '.join(wb.sheetnames)}"
         )
 
@@ -380,7 +380,7 @@ def continuous_regressors(df: pd.DataFrame, regressor_cols: list) -> list:
 
 def sign_check(coef_df: pd.DataFrame, continuous_cols: list, p_thresh: float = 0.05) -> list:
     """Flag continuous (non-binary) regressors that come back with a
-    significant NEGATIVE coefficient in the real MetrixND fit — often a sign
+    significant NEGATIVE coefficient in the real Just ND fit — often a sign
     of misspecification/collinearity rather than a genuine effect, though it
     can occasionally be a legitimate structural relationship."""
     flags = []
@@ -402,7 +402,7 @@ def sign_check(coef_df: pd.DataFrame, continuous_cols: list, p_thresh: float = 0
 
 
 def existing_binary_removal_candidates(coef_df: pd.DataFrame, p_thresh: float = 0.05) -> pd.DataFrame:
-    """Flag currently-included binary/event variables (mBin.* in MetrixND
+    """Flag currently-included binary/event variables (mBin.* in Just ND
     naming, or anything not a continuous driver) that are not significant in
     the REAL reported model — these are read straight from the Coef sheet,
     not the OLS proxy, since that's the more trustworthy source for variables
@@ -568,7 +568,7 @@ def build_recommendations(pw: ParsedWorkbook, p_thresh: float = 0.05, bic_pref: 
             delta_bic=None,
             delta_mape=None,
             pvalue=row["PValue"],
-            rationale=f"Not significant in the reported MetrixND fit (p={row['PValue']:.3f} > {p_thresh}).",
+            rationale=f"Not significant in the reported Just ND fit (p={row['PValue']:.3f} > {p_thresh}).",
         ))
         rank += 1
 
