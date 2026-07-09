@@ -1,7 +1,7 @@
 """
 ND Binary Tuning Assistant — Streamlit app.
 
-Upload a ND model export (.xlsx with Data/Coef/MStat/Err sheets) and get
+Upload an ND model export (.xlsx with Data/Coef/MStat/Err sheets) and get
 a ranked list of binary-variable recommendations: which existing binaries look
 safe to drop, which missing calendar months are worth adding, which individual
 data points look like data-quality issues, and any regressor whose sign looks
@@ -22,7 +22,7 @@ st.set_page_config(page_title="ND Binary Tuning Assistant", layout="wide")
 
 st.title("ND Binary Tuning Assistant")
 st.caption(
-    "Upload a ND model export and get a ranked, Add: Yes/No list of "
+    "Upload an ND model export and get a ranked, Add: Yes/No list of "
     "binary-variable suggestions — same process used for manual model reviews, "
     "automated."
 )
@@ -42,7 +42,7 @@ with st.sidebar:
              "AIC-only is more permissive and will suggest more additions.",
     ) == "BIC-parsimony (recommended)"
     st.divider()
-    st.warning(az.AR_CAVEAT, icon="⚠️")
+    ar_ui_slot = st.container()  # filled in after a file is loaded, once AR(1)/MA(1) can be detected
 
 uploaded = st.file_uploader("Upload ND .xlsx export", type=["xlsx"])
 
@@ -62,10 +62,34 @@ except az.ParseError as e:
     st.error(str(e))
     st.stop()
 except Exception as e:
-    st.error(f"Couldn't read this file as a ND export: {e}")
+    st.error(f"Couldn't read this file as an ND export: {e}")
     st.stop()
 
 st.success(f"Loaded **{pw.file_name}** — target variable **{pw.target_name}**, {len(pw.data_df)} observations.")
+
+# ---------------------------------------------------------------------------
+# AR(1)/MA(1) controls — filled into the sidebar slot reserved above, now that
+# we know whether ND reported autocorrelation terms for this file.
+# ---------------------------------------------------------------------------
+with ar_ui_slot:
+    st.subheader("AR(1) correction")
+    if pw.ar1 is not None:
+        st.caption(f"Detected AR(1) = {pw.ar1:.4f} in the Coef sheet.")
+        apply_ar = st.checkbox("Apply AR(1) correction to the proxy fit", value=abs(pw.ar1) > 0.05)
+        rho_input = st.number_input(
+            "AR(1) value used (edit to override)",
+            min_value=-0.99, max_value=0.99, value=float(pw.ar1), step=0.01, format="%.3f",
+            disabled=not apply_ar,
+        )
+    else:
+        st.caption("No AR(1) term detected in the Coef sheet for this file.")
+        apply_ar = st.checkbox("Apply a manual AR(1) correction anyway", value=False)
+        rho_input = st.number_input(
+            "AR(1) value to use", min_value=-0.99, max_value=0.99, value=0.0, step=0.01,
+            format="%.3f", disabled=not apply_ar,
+        )
+    effective_rho = float(rho_input) if apply_ar else 0.0
+    st.warning(az.build_ar_caveat(effective_rho, pw.ma1), icon="⚠️")
 
 # ---------------------------------------------------------------------------
 # Section 1: current model diagnostics
@@ -123,7 +147,12 @@ else:
 # ---------------------------------------------------------------------------
 st.header("3. Ranked recommendations")
 
-recs, extras = az.build_recommendations(pw, p_thresh=p_thresh, bic_pref=bic_pref)
+recs, extras = az.build_recommendations(pw, p_thresh=p_thresh, bic_pref=bic_pref, rho=effective_rho)
+
+if effective_rho:
+    st.caption(f"AR(1) correction active: ρ = {effective_rho:.3f} applied to all proxy fits below.")
+else:
+    st.caption("AR(1) correction is off for this run — see the sidebar to enable it.")
 
 if not recs:
     st.info("No missing months, no removable binaries, and no sign-check flags — this model looks tight already.")
@@ -164,8 +193,8 @@ st.caption(
 # ---------------------------------------------------------------------------
 st.header("4. Supporting detail")
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["By-month residual bias", "Forward-selection trace", "Outlier residuals", "Sign checks"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["By-month residual bias", "Forward-selection trace", "Outlier residuals", "Sign checks", "AR(1) diagnostics"]
 )
 
 with tab1:
@@ -217,8 +246,45 @@ with tab4:
     else:
         st.info("No sign-check flags.")
 
+with tab5:
+    st.write(
+        "Residual ACF/PACF from the Err sheet, used the classic Box-Jenkins way to check "
+        "whether an AR(1) term is warranted: a PACF that cuts off after lag 1 while the ACF "
+        "decays gradually is the AR(1) signature. Bars beyond the shaded significance band "
+        "(±1.96/√n) are statistically distinguishable from white noise."
+    )
+    ar1_diag = az.suggest_ar1(pw)
+    if ar1_diag is None:
+        st.info("Not enough residual history in the Err sheet to compute ACF/PACF (need at least 8 points).")
+    else:
+        lags = list(range(1, ar1_diag["max_lag"] + 1))
+        chart_df = pd.DataFrame({"ACF": ar1_diag["acf"], "PACF": ar1_diag["pacf"]}, index=lags)
+        st.bar_chart(chart_df)
+        st.caption(
+            f"n = {ar1_diag['n']} residuals · significance band ≈ ±{ar1_diag['band']:.3f} "
+            "(bars taller than this, in either direction, are non-trivial)."
+        )
+        st.write(f"**Pattern read:** {ar1_diag['pattern']}")
+
+        st.divider()
+        st.subheader("AR(1) suggestion")
+        badge = "🟢 Add: Yes" if ar1_diag["add_yes_no"] == "Yes" else "⚪ Add: No"
+        st.metric("Candidate AR(1) ρ (from lag-1 ACF)", f"{ar1_diag['candidate_rho']:+.3f}")
+        cA, cB, cC = st.columns(3)
+        cA.metric("ΔAIC vs. no-AR proxy", f"{ar1_diag['delta_aic']:+.2f}" if ar1_diag["delta_aic"] is not None else "—")
+        cB.metric("ΔBIC vs. no-AR proxy", f"{ar1_diag['delta_bic']:+.2f}" if ar1_diag["delta_bic"] is not None else "—")
+        cC.metric("Verdict", badge)
+        st.caption(ar1_diag["rationale"])
+        st.caption(
+            "Scope note: this suggestion only tests AR(1), validated with the same AIC/BIC "
+            "parsimony rule used elsewhere in this app. An MA(1) or higher-order AR pattern "
+            "may still show up in the chart above (see the pattern read) but isn't "
+            "numerically validated here — treat that as a manual follow-up in ND."
+        )
+
 with st.expander("Raw parsed data (debug)"):
     st.write("Regressor columns detected:", pw.regressor_cols)
     st.write("Bare seasonal month dummies found:", pw.month_dummy_cols)
     st.write("Missing months:", [az.MONTH_ABBR[m - 1] for m in pw.missing_months])
+    st.write("Detected AR(1):", pw.ar1, "| Detected MA(1):", pw.ma1, "| Effective rho used:", extras.get("effective_rho"))
     st.dataframe(pw.data_df.head(20), use_container_width=True)
