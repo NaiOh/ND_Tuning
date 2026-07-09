@@ -1,7 +1,7 @@
-# Just ND Binary Tuning Assistant
+# ND Binary Tuning Assistant
 
 A Streamlit app that automates the model-review process used throughout this
-project: upload a Just ND xlsx export, get back a ranked, **Add: Yes/No** list
+project: upload a ND xlsx export, get back a ranked, **Add: Yes/No** list
 of binary-variable suggestions — which existing binaries look safe to drop,
 which missing calendar months are worth adding, which individual residuals
 look like data-quality issues rather than real seasonal effects, and any
@@ -9,14 +9,14 @@ regressor whose coefficient sign looks off.
 
 ## What it expects
 
-A `.xlsx` file exported from Just ND with (at least) these sheets:
+A `.xlsx` file exported from ND with (at least) these sheets:
 
 - **Data** — columns `Year, Month, <target>, <regressor 1>, <regressor 2>, ...`
-- **Coef** — `Variable, Coefficient, StdErr, T-Stat, P-Value, ...` (as Just ND reports it)
+- **Coef** — `Variable, Coefficient, StdErr, T-Stat, P-Value, ...` (as ND reports it)
 - **MStat** — model diagnostics (R², AIC, BIC, Durbin-Watson, Ljung-Box, Jarque-Bera, MAPE, ...)
 - **Err** — `Year, Month, Actual, Pred, Resid, %Resid, StdResid`
 
-This matches the standard Just ND model export format used for ResUPC,
+This matches the standard ND model export format used for ResUPC,
 ComUPC, and the SalesShr models.
 
 ## Running locally
@@ -46,7 +46,7 @@ and upload an `.xlsx` file.
 
 ## Important limitation — read before trusting results
 
-Just ND's real model can include **AR(1)/MA(1)** autocorrelation correction.
+ND's real model can include **AR(1)/MA(1)** autocorrelation correction.
 This app has no access to that internal fitting process — it only sees the
 Data/Coef/MStat/Err sheets you export. For any **candidate** variable not
 already in the model (e.g. a missing month being tested), the app fits a
@@ -57,14 +57,14 @@ static OLS proxy sees the same shift and (wrongly) attributes it to whatever
 binary happens to correlate with it.
 
 Practical rule of thumb: treat every "Add: Yes" suggestion as a hypothesis to
-test by actually adding it in Just ND and re-fitting — not as a final
+test by actually adding it in ND and re-fitting — not as a final
 answer. The app's job is to narrow down what to try, not to replace
 re-fitting the real model.
 
 For variables **already in the model** (existing binaries flagged for
 removal, and the sign-check flags), the app reads the real reported
 coefficients/p-values straight from the Coef sheet, so those are as
-trustworthy as Just ND's own fit.
+trustworthy as ND's own fit.
 
 ## Files
 
